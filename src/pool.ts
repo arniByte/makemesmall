@@ -2,6 +2,8 @@ import type { JobRequest, JobResult } from './worker';
 
 type Pending = { job: JobRequest; resolve: (r: JobResult) => void };
 
+const CANCELLED: JobResult = { id: -1, ok: false, name: '', error: 'cancelled', cancelled: true };
+
 export class WorkerPool {
   private workers: Worker[] = [];
   private idle: Worker[] = [];
@@ -32,6 +34,18 @@ export class WorkerPool {
       this.queue.push({ job, resolve });
       this.pump();
     });
+  }
+
+  // Terminates every worker, dropping queued and in-flight jobs. Pending
+  // promises settle as cancelled so callers can stop counting them.
+  dispose(): void {
+    for (const worker of this.workers) worker.terminate();
+    for (const resolve of this.busy.values()) resolve(CANCELLED);
+    for (const pending of this.queue) pending.resolve(CANCELLED);
+    this.workers = [];
+    this.idle = [];
+    this.queue = [];
+    this.busy.clear();
   }
 
   private pump(): void {

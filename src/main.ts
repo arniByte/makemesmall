@@ -1,6 +1,6 @@
 import './style.css';
 import { WorkerPool } from './pool';
-import { buildZip, type Bytes, type ZipEntry } from './zip';
+import { buildZip, crc32, type Bytes, type ZipEntry } from './zip';
 import type { FormatMode, JobResult, QualityPreset } from './worker';
 
 type Item = {
@@ -9,31 +9,33 @@ type Item = {
   name: string;
   status: 'queue' | 'work' | 'done' | 'error';
   outName?: string;
-  bytes?: Bytes;
+  bytes?: Bytes; // absent when the original is kept — read lazily at download
   crc?: number;
   size?: number;
-  quality?: number;
   untouched?: boolean;
   error?: string;
   row?: HTMLElement;
 };
+
+type Run = { active: number };
 
 const IMAGE_RE = /\.(jpe?g|png|webp|bmp|gif|avif)$/i;
 
 const settings = {
   preset: 'balanced' as QualityPreset,
   format: 'webp' as FormatMode,
-  maxDim: 0,
 };
 
 const items: Item[] = [];
 let nextId = 0;
-let running = 0;
 let pool: WorkerPool | null = null;
+let currentRun: Run | null = null;
 let zipUrl: string | null = null;
 
 const app = document.querySelector<HTMLDivElement>('#app')!;
 app.innerHTML = `
+  <button id="theme" class="theme-toggle" title="Тема" aria-label="Тема"></button>
+
   <main class="shell">
     <header class="hero">
       <h1>MakeMeSmall</h1>
@@ -42,9 +44,9 @@ app.innerHTML = `
 
     <section class="controls" aria-label="Настройки">
       <div class="control">
-        <span class="control-label">Качество</span>
+        <span class="control-label">Режим</span>
         <div class="segmented" data-setting="preset">
-          <button data-value="max">Максимум</button>
+          <button data-value="max">Качество</button>
           <button data-value="balanced" class="active">Оптимально</button>
           <button data-value="small">Компактно</button>
         </div>
@@ -56,15 +58,6 @@ app.innerHTML = `
           <button data-value="jpeg">JPEG</button>
           <button data-value="png">PNG</button>
           <button data-value="keep">Оригинал</button>
-        </div>
-      </div>
-      <div class="control">
-        <span class="control-label">Разрешение</span>
-        <div class="segmented" data-setting="maxDim">
-          <button data-value="0" class="active">Оригинал</button>
-          <button data-value="3840">4K</button>
-          <button data-value="2560">2.5K</button>
-          <button data-value="1920">1080p</button>
         </div>
       </div>
     </section>
@@ -123,22 +116,55 @@ function fmt(bytes: number): string {
   return `${(bytes / 1024 / 1024).toFixed(bytes < 10 * 1024 * 1024 ? 2 : 1)} МБ`;
 }
 
+/* ---------- theme ---------- */
+
+type Theme = 'auto' | 'light' | 'dark';
+const THEMES: Theme[] = ['auto', 'light', 'dark'];
+const THEME_ICON: Record<Theme, string> = { auto: '◐', light: '☀', dark: '☾' };
+const THEME_NAME: Record<Theme, string> = { auto: 'Как в системе', light: 'Светлая', dark: 'Тёмная' };
+const themeBtn = el<HTMLButtonElement>('theme');
+
+function applyTheme(theme: Theme): void {
+  if (theme === 'auto') document.documentElement.removeAttribute('data-theme');
+  else document.documentElement.setAttribute('data-theme', theme);
+  themeBtn.textContent = THEME_ICON[theme];
+  themeBtn.title = `Тема: ${THEME_NAME[theme]}`;
+  try {
+    localStorage.setItem('mms-theme', theme);
+  } catch {
+    /* private mode — the choice just does not persist */
+  }
+}
+
+let theme: Theme = 'auto';
+try {
+  const saved = localStorage.getItem('mms-theme') as Theme | null;
+  if (saved && THEMES.includes(saved)) theme = saved;
+} catch {
+  /* ignore */
+}
+applyTheme(theme);
+themeBtn.addEventListener('click', () => {
+  theme = THEMES[(THEMES.indexOf(theme) + 1) % THEMES.length];
+  applyTheme(theme);
+});
+
 /* ---------- input collection ---------- */
 
 function isImage(file: File): boolean {
   return file.type.startsWith('image/') || IMAGE_RE.test(file.name);
 }
 
-async function readDirectory(entry: FileSystemDirectoryEntry, prefix: string, out: Promise<void>[], files: File[]): Promise<void> {
+async function readDirectory(entry: FileSystemDirectoryEntry, prefix: string, files: File[]): Promise<void> {
   const reader = entry.createReader();
   for (;;) {
     const batch: FileSystemEntry[] = await new Promise((resolve, reject) => reader.readEntries(resolve, reject));
     if (!batch.length) return;
-    for (const child of batch) await walkEntry(child, prefix, out, files);
+    for (const child of batch) await walkEntry(child, prefix, files);
   }
 }
 
-async function walkEntry(entry: FileSystemEntry, prefix: string, out: Promise<void>[], files: File[]): Promise<void> {
+async function walkEntry(entry: FileSystemEntry, prefix: string, files: File[]): Promise<void> {
   if (entry.isFile) {
     const file: File = await new Promise((resolve, reject) => (entry as FileSystemFileEntry).file(resolve, reject));
     if (isImage(file)) {
@@ -147,7 +173,7 @@ async function walkEntry(entry: FileSystemEntry, prefix: string, out: Promise<vo
     }
     return;
   }
-  await readDirectory(entry as FileSystemDirectoryEntry, prefix + entry.name + '/', out, files);
+  await readDirectory(entry as FileSystemDirectoryEntry, prefix + entry.name + '/', files);
 }
 
 async function filesFromDrop(dt: DataTransfer): Promise<File[]> {
@@ -159,7 +185,7 @@ async function filesFromDrop(dt: DataTransfer): Promise<File[]> {
   if (!entries.length) return Array.from(dt.files).filter(isImage);
 
   const files: File[] = [];
-  for (const entry of entries) await walkEntry(entry, '', [], files);
+  for (const entry of entries) await walkEntry(entry, '', files);
   return files;
 }
 
@@ -173,38 +199,41 @@ function addFiles(files: File[]): void {
   const images = files.filter(isImage);
   if (!images.length) return;
 
-  for (const file of images) {
+  const batch: Item[] = images.map((file) => {
     const item: Item = { id: nextId++, file, name: pathOf(file), status: 'queue' };
-    items.push(item);
     item.row = renderRow(item);
     list.append(item.row);
-  }
+    items.push(item);
+    return item;
+  });
+
   summary.hidden = false;
   bar.hidden = false;
   drop.classList.add('compact');
-  process(images.map((_, i) => items[items.length - images.length + i]));
+  enqueue(batch, false);
 }
 
-function process(batch: Item[]): void {
-  pool ??= new WorkerPool();
+// `fresh` cancels everything in flight first — that is what a settings change
+// does. Without it each change piled another full batch onto the same queue.
+function enqueue(batch: Item[], fresh: boolean): void {
+  if (fresh || !pool || !currentRun) {
+    pool?.dispose();
+    pool = new WorkerPool();
+    currentRun = { active: 0 };
+  }
+  const run = currentRun;
+  run.active += batch.length;
   invalidateZip();
 
   for (const item of batch) {
-    running++;
     item.status = 'work';
     updateRow(item);
     pool
-      .run({
-        id: item.id,
-        file: item.file,
-        name: item.name,
-        preset: settings.preset,
-        format: settings.format,
-        maxDim: settings.maxDim,
-      })
-      .then((result) => apply(item, result))
-      .finally(() => {
-        running--;
+      .run({ id: item.id, file: item.file, name: item.name, preset: settings.preset, format: settings.format })
+      .then((result) => {
+        if (currentRun !== run) return; // stale batch, its results are dropped
+        apply(item, result);
+        run.active--;
         updateSummary();
       });
   }
@@ -214,12 +243,12 @@ function process(batch: Item[]): void {
 function apply(item: Item, result: JobResult): void {
   if (result.ok) {
     item.status = 'done';
-    item.outName = result.name;
-    item.bytes = result.bytes;
-    item.crc = result.crc;
-    item.size = result.size;
-    item.quality = result.quality;
     item.untouched = result.untouched;
+    item.outName = result.name;
+    item.bytes = result.bytes ?? undefined;
+    item.crc = result.crc ?? undefined;
+    item.size = result.size;
+    item.error = undefined;
   } else {
     item.status = 'error';
     item.error = result.error;
@@ -232,11 +261,12 @@ function reprocessAll(): void {
   for (const item of items) {
     item.status = 'queue';
     item.bytes = undefined;
+    item.crc = undefined;
     item.size = undefined;
     item.error = undefined;
     updateRow(item);
   }
-  process(items.slice());
+  enqueue(items.slice(), true);
 }
 
 /* ---------- rendering ---------- */
@@ -258,15 +288,14 @@ function updateRow(item: Item): void {
   const fill = row.querySelector<HTMLElement>('.row-fill')!;
   const stat = row.querySelector<HTMLElement>('.row-stat')!;
   row.dataset.status = item.status;
+  row.toggleAttribute('data-untouched', item.status === 'done' && !!item.untouched);
 
   if (item.status === 'done' && item.size !== undefined) {
-    const ratio = item.size / item.file.size;
-    fill.style.width = `${Math.min(100, ratio * 100)}%`;
-    const saved = Math.round((1 - ratio) * 100);
-    const badge = saved >= 0 ? `<span class="badge">−${saved}%</span>` : `<span class="badge grew">+${-saved}%</span>`;
+    fill.style.width = `${Math.min(100, (item.size / item.file.size) * 100)}%`;
+    const saved = Math.round((1 - item.size / item.file.size) * 100);
     stat.innerHTML = item.untouched
       ? `<span class="muted">уже оптимально</span> <b>${fmt(item.size)}</b>`
-      : `<span class="muted">${fmt(item.file.size)} →</span> <b>${fmt(item.size)}</b> ${badge}`;
+      : `<span class="muted">${fmt(item.file.size)} →</span> <b>${fmt(item.size)}</b> <span class="badge">−${saved}%</span>`;
   } else if (item.status === 'error') {
     fill.style.width = '0%';
     stat.innerHTML = `<span class="err">${item.error}</span>`;
@@ -281,16 +310,16 @@ function updateSummary(): void {
   const failed = items.filter((i) => i.status === 'error').length;
   const before = done.reduce((sum, i) => sum + i.file.size, 0);
   const after = done.reduce((sum, i) => sum + (i.size || 0), 0);
-  const saving = before ? Math.round((1 - after / before) * 100) : 0;
+  const busy = currentRun ? currentRun.active > 0 : false;
 
-  el('saving-value').textContent = before ? `${saving >= 0 ? '−' : '+'}${Math.abs(saving)}%` : '…';
+  el('saving-value').textContent = before ? `−${Math.round((1 - after / before) * 100)}%` : '…';
   el('summary-sizes').textContent = before ? `${fmt(before)} → ${fmt(after)}` : 'обработка';
   el('summary-count').textContent =
     `${done.length} из ${items.length}` + (failed ? ` · ${failed} с ошибкой` : '');
   el('progress-bar').style.width = `${items.length ? ((done.length + failed) / items.length) * 100 : 0}%`;
 
-  downloadBtn.disabled = running > 0 || !done.length;
-  downloadBtn.textContent = running > 0 ? 'Сжимаю…' : done.length === 1 ? 'Скачать файл' : 'Скачать ZIP';
+  downloadBtn.disabled = busy || !done.length;
+  downloadBtn.textContent = busy ? 'Сжимаю…' : done.length === 1 ? 'Скачать файл' : 'Скачать ZIP';
 }
 
 /* ---------- output ---------- */
@@ -302,15 +331,26 @@ function invalidateZip(): void {
   }
 }
 
-function uniqueNames(entries: Item[]): ZipEntry[] {
+// Items whose original was kept carry no bytes until now, so the archive holds
+// one copy of the data instead of two for the whole session.
+async function materialize(item: Item): Promise<{ bytes: Bytes; crc: number }> {
+  if (item.bytes && item.crc !== undefined) return { bytes: item.bytes, crc: item.crc };
+  const bytes = new Uint8Array(await item.file.arrayBuffer());
+  return { bytes, crc: crc32(bytes) };
+}
+
+async function entriesOf(done: Item[]): Promise<ZipEntry[]> {
   const seen = new Map<string, number>();
-  return entries.map((item) => {
-    let name = item.outName!;
+  const entries: ZipEntry[] = [];
+  for (const item of done) {
+    const { bytes, crc } = await materialize(item);
+    let name = item.outName || item.name;
     const count = seen.get(name.toLowerCase()) || 0;
     seen.set(name.toLowerCase(), count + 1);
     if (count) name = name.replace(/(\.[^./\\]+)$/, ` (${count})$1`);
-    return { name, bytes: item.bytes!, crc: item.crc! };
-  });
+    entries.push({ name, bytes, crc });
+  }
+  return entries;
 }
 
 function save(blob: Blob, filename: string): void {
@@ -322,28 +362,31 @@ function save(blob: Blob, filename: string): void {
   link.click();
 }
 
-downloadBtn.addEventListener('click', () => {
-  const done = items.filter((i) => i.status === 'done' && i.bytes);
+downloadBtn.addEventListener('click', async () => {
+  const done = items.filter((i) => i.status === 'done');
   if (!done.length) return;
 
-  if (done.length === 1) {
-    const only = done[0];
-    save(new Blob([only.bytes!]), only.outName!.split('/').pop()!);
-    return;
-  }
   downloadBtn.disabled = true;
-  downloadBtn.textContent = 'Собираю ZIP…';
-  setTimeout(() => {
-    try {
-      save(buildZip(uniqueNames(done)), `makemesmall-${done.length}.zip`);
-    } catch (err) {
-      alert(err instanceof Error ? err.message : 'Не удалось собрать архив');
+  const label = downloadBtn.textContent;
+  downloadBtn.textContent = 'Собираю…';
+  try {
+    if (done.length === 1) {
+      const { bytes } = await materialize(done[0]);
+      save(new Blob([bytes]), (done[0].outName || done[0].name).split('/').pop()!);
+    } else {
+      save(buildZip(await entriesOf(done)), `makemesmall-${done.length}.zip`);
     }
-    updateSummary();
-  }, 16);
+  } catch (err) {
+    alert(err instanceof Error ? err.message : 'Не удалось собрать архив');
+  }
+  downloadBtn.textContent = label;
+  updateSummary();
 });
 
 el('clear').addEventListener('click', () => {
+  pool?.dispose();
+  pool = null;
+  currentRun = null;
   items.length = 0;
   list.innerHTML = '';
   summary.hidden = true;
@@ -359,12 +402,10 @@ el('clear').addEventListener('click', () => {
 document.querySelectorAll<HTMLElement>('.segmented').forEach((group) => {
   group.addEventListener('click', (event) => {
     const button = (event.target as HTMLElement).closest('button');
-    if (!button) return;
+    if (!button || button.classList.contains('active')) return;
     group.querySelectorAll('button').forEach((b) => b.classList.toggle('active', b === button));
-    const key = group.dataset.setting!;
     const value = button.dataset.value!;
-    if (key === 'maxDim') settings.maxDim = Number(value);
-    else if (key === 'preset') settings.preset = value as QualityPreset;
+    if (group.dataset.setting === 'preset') settings.preset = value as QualityPreset;
     else settings.format = value as FormatMode;
     reprocessAll();
   });

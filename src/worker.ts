@@ -9,7 +9,6 @@ export type JobRequest = {
   name: string;
   preset: QualityPreset;
   format: FormatMode;
-  maxDim: number; // 0 = original resolution
 };
 
 export type JobResult =
@@ -17,16 +16,15 @@ export type JobResult =
       id: number;
       ok: true;
       name: string;
-      bytes: Bytes;
-      crc: number;
-      originalSize: number;
+      // null when the original is kept: the main thread reads it from the File
+      // at download time instead of holding a second copy in memory.
+      bytes: Bytes | null;
+      crc: number | null;
       size: number;
-      width: number;
-      height: number;
       quality: number; // 0 for lossless paths
-      untouched: boolean; // original kept because re-encoding did not help
+      untouched: boolean;
     }
-  | { id: number; ok: false; name: string; error: string };
+  | { id: number; ok: false; name: string; error: string; cancelled?: boolean };
 
 // SSIM target per preset. Above ~0.995 the difference is not visible at 100%.
 const SSIM_TARGET: Record<QualityPreset, number> = {
@@ -169,9 +167,8 @@ async function run(job: JobRequest): Promise<JobResult> {
     return { id: job.id, ok: false, name: job.name, error: 'формат не поддерживается браузером' };
   }
 
-  const scale = job.maxDim ? Math.min(1, job.maxDim / Math.max(bitmap.width, bitmap.height)) : 1;
-  const width = Math.max(1, Math.round(bitmap.width * scale));
-  const height = Math.max(1, Math.round(bitmap.height * scale));
+  const width = bitmap.width;
+  const height = bitmap.height;
 
   const mime = outputMime(file, job.format, await supportsWebp());
   const lossless = mime === 'image/png';
@@ -190,31 +187,23 @@ async function run(job: JobRequest): Promise<JobResult> {
     ? await full.convertToBlob({ type: mime })
     : await full.convertToBlob({ type: mime, quality });
 
-  let bytes = new Uint8Array(await blob.arrayBuffer());
-  let name = rename(job.name, mime);
-  let untouched = false;
+  const bytes = new Uint8Array(await blob.arrayBuffer());
 
-  // Never hand back something bigger than what came in — unless the user asked
-  // for a specific container, in which case the conversion is the point.
-  const forcedConversion = (job.format === 'png' || job.format === 'jpeg') && file.type !== mime;
-  if (bytes.length >= file.size && scale === 1 && !forcedConversion) {
-    bytes = new Uint8Array(await file.arrayBuffer());
-    name = job.name;
-    untouched = true;
+  // Hard invariant: the output is never larger than the input. Whatever the
+  // requested format, a result that grew is thrown away and the original wins.
+  if (bytes.length >= file.size) {
+    return { id: job.id, ok: true, name: job.name, bytes: null, crc: null, size: file.size, quality: 0, untouched: true };
   }
 
   return {
     id: job.id,
     ok: true,
-    name,
+    name: rename(job.name, mime),
     bytes,
     crc: crc32(bytes),
-    originalSize: file.size,
     size: bytes.length,
-    width,
-    height,
-    quality: untouched ? 0 : quality,
-    untouched,
+    quality,
+    untouched: false,
   };
 }
 
@@ -226,7 +215,7 @@ self.onmessage = async (event: MessageEvent<JobRequest>) => {
   } catch (err) {
     result = { id: job.id, ok: false, name: job.name, error: err instanceof Error ? err.message : 'ошибка обработки' };
   }
-  if (result.ok) {
+  if (result.ok && result.bytes) {
     (self as unknown as Worker).postMessage(result, [result.bytes.buffer]);
   } else {
     (self as unknown as Worker).postMessage(result);

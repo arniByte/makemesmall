@@ -13,8 +13,9 @@
   color-scheme: light;
 }
 
+/* Dark applies when the system asks for it and the user has not forced light... */
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not([data-theme='light']) {
     --bg: #000000;
     --panel: #1c1c1e;
     --text: #f5f5f7;
@@ -27,6 +28,21 @@
     --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 12px 32px rgba(0, 0, 0, 0.5);
     color-scheme: dark;
   }
+}
+
+/* ...and always when the user picked dark explicitly. */
+:root[data-theme='dark'] {
+  --bg: #000000;
+  --panel: #1c1c1e;
+  --text: #f5f5f7;
+  --muted: #8e8e93;
+  --line: rgba(255, 255, 255, 0.12);
+  --accent: #0a84ff;
+  --accent-soft: rgba(10, 132, 255, 0.14);
+  --ok: #32d74b;
+  --err: #ff453a;
+  --shadow: 0 1px 2px rgba(0, 0, 0, 0.4), 0 12px 32px rgba(0, 0, 0, 0.5);
+  color-scheme: dark;
 }
 
 * { box-sizing: border-box; }
@@ -42,7 +58,7 @@ html, body {
 .shell {
   max-width: 780px;
   margin: 0 auto;
-  padding: 88px 24px 140px;
+  padding: 88px 24px 168px;
 }
 
 .hero { text-align: center; margin-bottom: 56px; }
@@ -238,6 +254,7 @@ html, body {
 }
 
 .row[data-status='error'] .row-fill { background: var(--err); }
+.row[data-untouched] .row-fill { background: var(--muted); opacity: 0.4; }
 
 .row-stat { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
 
@@ -273,6 +290,26 @@ html, body {
   box-shadow: var(--shadow);
   border: 1px solid var(--line);
 }
+
+.theme-toggle {
+  position: fixed;
+  top: 18px;
+  right: 18px;
+  z-index: 2;
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--panel) 82%, transparent);
+  backdrop-filter: saturate(180%) blur(20px);
+  color: var(--muted);
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+  transition: color 0.18s ease, transform 0.18s ease;
+}
+
+.theme-toggle:hover { color: var(--text); transform: translateY(-1px); }
 
 .foot {
   margin-top: 56px;
