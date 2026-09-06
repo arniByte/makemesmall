@@ -56,8 +56,7 @@ app.innerHTML = `
         <div class="segmented" data-setting="format">
           <button data-value="webp" class="active">WebP</button>
           <button data-value="jpeg">JPEG</button>
-          <button data-value="png">PNG</button>
-          <button data-value="keep">Оригинал</button>
+          <button data-value="keep">Как есть</button>
         </div>
       </div>
     </section>
